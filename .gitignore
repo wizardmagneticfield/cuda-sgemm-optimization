@@ -1,5 +1,6 @@
-build/
 sgemm
+build/
 results.csv
-profiles/
+profiles/*
+!profiles/.gitkeep
 *.ncu-rep

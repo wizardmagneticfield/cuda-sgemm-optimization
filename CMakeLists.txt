@@ -15,5 +15,5 @@ find_package(CUDAToolkit REQUIRED)
 
 add_executable(sgemm src/main.cu)
 target_include_directories(sgemm PRIVATE src)
-target_compile_options(sgemm PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo --use_fast_math>)
+target_compile_options(sgemm PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo>)
 target_link_libraries(sgemm PRIVATE CUDA::cublas)

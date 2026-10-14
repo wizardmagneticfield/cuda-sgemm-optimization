@@ -1,78 +1,83 @@
 # CUDA SGEMM Optimization
 
-Single-precision GEMM (`C = αAB + βC`, row-major) written from scratch in CUDA C++,
-benchmarked against cuBLAS and profiled with Nsight Compute. Target: **RTX 4090 (Ada, sm_89)**.
+Hand-written single-precision matrix multiply (`C = αAB + βC`, row-major) kernels in CUDA C++,
+optimized step by step, benchmarked against cuBLAS, and profiled with Nsight Compute.
+Target GPU: RTX 4090 (Ada, `sm_89`).
 
-| # | Kernel | Idea |
-|---|--------|------|
-| 0 | `cublas` | `cublasSgemm`, FP32 (TF32 disabled) — reference & upper bound |
-| 1 | `naive` | one thread per output; `threadIdx.x` → row, so warp loads are strided (uncoalesced) |
-| 2 | `coalesced` | same math, `threadIdx.x` → column, so each warp reads/writes one contiguous 128 B line |
-| 3 | `tiled32` | 32×32 thread block computes a 32×32 C tile; A/B tiles staged in shared memory with coalesced loads, cutting global loads per output from `2K` to `2K/32` |
+| Kernel | Idea |
+|---|---|
+| `naive` | One thread per output. Thread x-index walks rows, so global loads/stores are **uncoalesced**. Baseline. |
+| `coalesced` | Same math, but consecutive threads handle consecutive columns, so a warp reads/writes 32 contiguous floats (one 128 B line). |
+| `tiled16` / `tiled32` | Shared-memory tiling: each block stages a TILE×TILE tile of A and B in shared memory with coalesced loads and reuses it TILE times. |
+| `blocktile1d_64x64x8_tm8` | Each thread computes 8 outputs, raising arithmetic intensity per shared-memory load. |
 
-Kernels live in [`src/kernels.cuh`](src/kernels.cuh); the benchmark harness is [`src/main.cu`](src/main.cu).
+Every kernel is checked against cuBLAS (plain FP32, TF32 off) before it is timed. Matrices are
+square, from 256 to 8192. Kernels are in [`src/kernels.cuh`](src/kernels.cuh), the benchmark in
+[`src/main.cu`](src/main.cu).
 
-## Build & run
+## Build and run
 
-Requires CUDA 11.8+ (sm_89) and cuBLAS.
-
-```bash
-# CMake
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-./build/sgemm                      # all kernels, N = 256..4096
-
-# or plain make
-make && ./sgemm
-./sgemm tiled 4096                 # one kernel, one size
-make ARCH=sm_86                    # other GPUs
-```
-
-Each run checks every kernel against cuBLAS, prints time / GFLOP/s / % of cuBLAS / speedup over
-naive, and writes `results.csv`.
-
-## Profiling (Nsight Compute)
+Needs an NVIDIA GPU, the CUDA Toolkit (nvcc), and cuBLAS (comes with the toolkit).
 
 ```bash
-./scripts/profile_ncu.sh 4096      # writes profiles/{naive,coalesced,tiled}.ncu-rep
-ncu-ui profiles/tiled.ncu-rep
+make ARCH=sm_89               # sm_89 = RTX 40xx, sm_86 = RTX 30xx, sm_75 = T4
+./sgemm                       # all kernels, sizes 256..8192
+./sgemm 1024 4096             # specific sizes
+./sgemm --kernel tiled32 4096 # one kernel (naive always runs too, for the speedup column)
 ```
 
-Things to look at in each report:
+Or with CMake: `cmake -B build && cmake --build build -j && ./build/sgemm`.
 
-- **Global-load sectors / request** (`l1tex__t_sectors_pipe_lsu_mem_global_op_ld` ÷ `..._requests_...`):
-  naive is close to 32 sectors per request (each thread hits its own sector). Coalesced and tiled
-  are close to 4, i.e. one 128 B line per warp.
-- **DRAM / L1 throughput vs. FMA pipe utilisation**: naive and coalesced are memory-bound. Tiling
-  moves the bottleneck to shared-memory bandwidth and `__syncthreads` stalls.
-- **Shared-memory bank conflicts**: zero. `As[ty][k]` is a broadcast within a warp, and `Bs[k][tx]`
-  hits 32 different banks.
-- **Warp stall reasons**: for `tiled32` most stalls are `MIO Throttle` / `Short Scoreboard`. Each FMA
-  needs two shared-memory loads, so the kernel is limited by shared-memory traffic, not compute.
+Each run prints time, GFLOP/s, % of cuBLAS, speedup over naive, and PASS/FAIL, and writes
+everything to `results.csv`. Each kernel is timed over ~0.5 s of repeated launches for a stable
+average.
 
-## Results (RTX 4090, N = 4096)
+**No local GPU?** Use Google Colab (Runtime → Change runtime type → T4 GPU):
 
-> Fill in from `results.csv` after running on your GPU.
+```bash
+!git clone https://github.com/wizardmagneticfield/cuda-sgemm-optimization.git
+%cd cuda-sgemm-optimization
+!make ARCH=sm_75 && ./sgemm
+```
 
-| Kernel | GFLOP/s | % cuBLAS | × naive |
-|--------|--------:|---------:|--------:|
-| naive | | | 1.0× |
-| coalesced | | | |
-| tiled32 | | | |
-| cuBLAS | | 100% | |
+## Profiling with Nsight Compute
 
-## Why tiling helps, and where it stops helping
+```bash
+make profile                        # = ./scripts/profile_ncu.sh 4096
+ncu-ui profiles/tiled32.ncu-rep
+```
 
-The naive kernel does 2 global loads per FMA. It reaches only a few hundred GFLOP/s because
-uncoalesced access wastes most of each 32 B sector it fetches. Coalescing alone gives a large
-gain. Shared-memory tiling then reuses each loaded element 32 times from on-chip memory.
+The script writes one report per kernel to `profiles/` and prints the key metrics. Things to look at:
 
-`tiled32` still does 2 shared-memory loads per FMA, because each thread computes only one output.
-Each 1024-thread block uses 40 registers per thread and 8 KB of shared memory (ptxas, sm_89), so
-only one block fits on an SM. That is 32 of 48 warps (67% occupancy), and every `__syncthreads`
-stalls all of them. That is why it sits well below cuBLAS. Next steps:
+- **Global-load sectors per request** (`l1tex__t_sectors_..._ld` ÷ `l1tex__t_requests_..._ld`):
+  ~32 for `naive` (every thread hits its own 32 B sector), ~4 for the others (one 128 B line per warp).
+- **Shared-memory bank conflicts**: ~0 for `tiled32`. `As[ty][k]` is a broadcast within a warp and
+  `Bs[k][tx]` hits 32 consecutive banks, so no padding is needed.
+- **Occupancy**: `tiled32` uses 1024-thread blocks, so only one block fits per SM (32 of 48 warps).
+- **Warp State Statistics**: `Stall MIO Throttle` / `Stall Short Scoreboard` mean waiting on shared
+  memory; `Stall Long Scoreboard` means waiting on global memory.
 
-1. **Register blocking (1D/2D thread tiles)**: each thread computes 8 or 8×8 outputs, reusing values
-   from registers.
-2. **Vectorized `float4` loads** and a transposed A tile in shared memory.
-3. **Double buffering / `cp.async`** to overlap global→shared copies with compute.
-4. **Warp tiling** to match the cuBLAS/CUTLASS hierarchy.
+## Results
+
+> Fill this in with numbers from **your** runs (`results.csv`). Note which GPU you used.
+
+GPU: _____
+
+| Kernel | N=1024 GFLOP/s | N=4096 GFLOP/s | % of cuBLAS (4096) | Speedup vs naive |
+|---|---|---|---|---|
+| cuBLAS | | | 100% | |
+| naive | | | | 1× |
+| coalesced | | | | |
+| tiled32 | | | | |
+| blocktile1d | | | | |
+
+## What I learned
+
+_Write 3–5 bullets here after profiling: what bottleneck you saw in Nsight, what you changed, and what happened._
+
+## Ideas for next steps
+
+- 2D block tiling (each thread computes a TM×TN sub-tile)
+- Vectorized `float4` loads
+- Double buffering shared memory to overlap loads and compute
+- Warp tiling
