@@ -1,0 +1,5 @@
+build/
+sgemm
+results.csv
+profiles/
+*.ncu-rep
